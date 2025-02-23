@@ -42,8 +42,12 @@ class Config:
     output_path: str
     cookie_path: str
     timeout: int
+    retries: int
+    retry_wait: int
     vp_width: int
     vp_height: int
+    img_format: str
+    img_quality: int
 
     def read(path: str = "config.ini") -> "Config":
         config = configparser.ConfigParser()
@@ -55,8 +59,12 @@ class Config:
             output_path=config["storage"]["output-path"],
             cookie_path=config["storage"]["cookie-path"],
             timeout=int(config["timeouts"]["default"]),
+            retry_wait=int(config["timeouts"]["retry-wait"]),
+            retries=int(config["timeouts"]["retries"]),
             vp_width=int(config["viewport"]["width"]),
             vp_height=int(config["viewport"]["height"]),
+            img_format=config["image"]["format"],
+            img_quality=int(config["image"]["quality"]),
         )
 
 
@@ -205,17 +213,16 @@ def _signin_cookies(page: pw.Page, config: Config):
         json.dump(cookies, f)
 
 
-import uuid
-
-
 def _combine_canvas_sidebyside(
+    config: Config,
     img_left_data: bytes,
     img_right_data: bytes,
 ) -> bytes:
     """
-    Takes two PNG-Images as bytes-Objects and puts them side-by-side
+    Takes two images as bytes-Objects and puts them side-by-side
     returning the resulting image as a bytes-Object. Will internally
-    convert the image to RGB-color.
+    convert the image to RGB-color and follows the format and quality
+    specified in the config.
     """
 
     img_left = Image.open(BytesIO(img_left_data))
@@ -230,16 +237,43 @@ def _combine_canvas_sidebyside(
     new_img.paste(img_right, (img_left.width, 0))
 
     output = BytesIO()
-    new_img.save(output, format="JPEG", quality=90)
+    new_img.save(output, format=config.img_format.upper(), quality=config.img_quality)
     output = output.getvalue()
 
     return output
 
 
+def _zoom_page(
+    page: pw.Page,
+):
+    """
+    Zooms the canvas to expose higher resolution image.
+    """
+
+    visible_zoomed = page.locator(".spread-wrapper:visible")
+
+    is_zoomed = visible_zoomed.count() > 0
+
+    if not is_zoomed:
+        view = page.locator("div[id='viewerContainer']")
+        view.click()
+        visible_zoomed.wait_for(state="attached")
+
+
 def _fetch_canvas_imagedata(
-    page: pw.Page, canvas_id: int, retry: int = 10
+    config: Config, page: pw.Page, canvas_id: int
 ) -> Optional[bytes]:
-    for _ in range(retry):
+    """
+    Fetches the image data for canvas with given id.
+    This canvas must be loaded, otherwise the operation will fail.
+    Retries according to config to allow for lazy-loading.
+    Images are returned as bytes-object in PNG to preserve
+    quality and prevent double-jpeg compression.
+    """
+
+    for _ in range(config.retries):
+        _zoom_page(page)
+
         try:
             image_data = page.evaluate(
                 f"""(
@@ -249,7 +283,7 @@ def _fetch_canvas_imagedata(
                         ctx.globalCompositeOperation = "destination-over"; 
                         ctx.fillStyle = "white";
                         ctx.fillRect(0, 0, canvas.width, canvas.height);
-                        return canvas.toDataURL("image/jpeg", 0.90).split(',')[1];
+                        return canvas.toDataURL("image/png").split(',')[1];
                     }})();
                 """
             )
@@ -259,7 +293,8 @@ def _fetch_canvas_imagedata(
             return image_data
 
         except:
-            page.wait_for_timeout(100)
+            page.wait_for_timeout(config.retry_wait)
+
     return None
 
 
@@ -271,7 +306,7 @@ def _download_article(page: pw.Page, config: Config, year: int, month: int):
     and places it in the download directory from config.
     """
 
-    article_url = f"https://archive.nationalgeographic.com/national-geographic/{str(year)}-{MONTH_MAP[month]}/flipbook/1/"
+    article_url = f"https://archive.nationalgeographic.com/national-geographic/{str(year)}-{MONTH_MAP[month]}"
 
     page.goto(article_url)
 
@@ -282,14 +317,10 @@ def _download_article(page: pw.Page, config: Config, year: int, month: int):
     fullscreen_button.click()
 
     n_pages = page.locator("div[class='spreaditem-div']").count()
-    n_pages = 30
 
-    pbar = tqdm(
-        desc=f"Issue {month+1}/{year}: ",
-        total=n_pages,
-    )
+    pbar = tqdm(desc=f"Issue {month+1}/{year}: ", total=n_pages)
 
-    output_path = os.path.join(config.output_path, f"natgeo-{month+1}-{year}.pdf")
+    output_path = os.path.join(config.output_path, f"natgeo-{year}-{month+1:02d}.pdf")
 
     c = canvas.Canvas(output_path)
 
@@ -299,23 +330,70 @@ def _download_article(page: pw.Page, config: Config, year: int, month: int):
         c.drawImage(ImageReader(BytesIO(img)), 0, 0, width, height)
         c.showPage()
 
-    __add_to_canvas(_fetch_canvas_imagedata(page, 1))
-
+    cover_data = _fetch_canvas_imagedata(config, page, 1)
+    __add_to_canvas(cover_data)
     pbar.update(1)
 
     for canvas_id in range(2, n_pages + 1, 2):
         page.wait_for_load_state("networkidle")
+
         next_button = page.locator("button[id='nextPage']")
         next_button.click()
-        left_data = _fetch_canvas_imagedata(page, canvas_id)
-        right_data = _fetch_canvas_imagedata(page, canvas_id + 1)
-        combined = _combine_canvas_sidebyside(left_data, right_data)
-        __add_to_canvas(combined)
-        pbar.update(2)
+
+        left_data = _fetch_canvas_imagedata(config, page, canvas_id)
+        right_data = _fetch_canvas_imagedata(config, page, canvas_id + 1)
+
+        if left_data is None:
+            tqdm.write(f"Skipping Canvas-ID {canvas_id} due to Error.")
+        if right_data is None:
+            __add_to_canvas(left_data)
+            pbar.update(1)
+        else:
+            combined = _combine_canvas_sidebyside(config, left_data, right_data)
+            __add_to_canvas(combined)
+            pbar.update(2)
 
     c.save()
 
     pbar.close()
+
+
+def _download_articel_retry(
+    page: pw.Page, config: Config, year: int, month: int
+) -> bool:
+    for _ in range(config.retries):
+        try:
+            _download_article(page, config, year, month)
+            return True
+        except:
+            pass
+
+    tqdm.write(f"Skipping {month+1}/{year} due to Error!")
+
+    return False
+
+
+def _get_timerange(date_start: str, date_end: str) -> List[Tuple[int, int]]:
+    """
+    Given a start and end date in format MM-YYYY will generate a list of tuple
+    (month,year) for all months and years in the range of these two dates.
+    Month is zero-offset so January is 0, December 11.
+    """
+
+    year_start, month_start = _format_date(date_start)
+    year_end, month_end = _format_date(date_end)
+
+    assert year_start <= year_end
+    assert month_start <= month_end
+
+    total_months = (year_end - year_start) * 12 + (month_end - month_start)
+
+    timerange = [
+        ((month_start + i) % 12, year_start + (month_start + i) // 12)
+        for i in range(0, total_months + 1)
+    ]
+
+    return timerange
 
 
 def fetch_natgeo_range(config: Config, date_start: str, date_end: str):
@@ -327,11 +405,9 @@ def fetch_natgeo_range(config: Config, date_start: str, date_end: str):
     To download just a single magazine set date_end == date_start.
     """
 
-    year_start, month_start = _format_date(date_start)
-    year_end, month_end = _format_date(date_end)
+    timerange = _get_timerange(date_start, date_end)
 
-    current_year = year_start
-    current_month = month_start
+    pbar = tqdm(desc="Total", total=len(timerange))
 
     with pw.sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -342,30 +418,26 @@ def fetch_natgeo_range(config: Config, date_start: str, date_end: str):
 
         _signin_cookies(page, config)
 
-        while True:
-            _download_article(page, config, current_year, current_month)
-
-            current_month = (current_month + 1) % 12
-            current_year += current_month == 0
-
-            if current_year >= year_end and current_month > month_end:
-                break
+        for month, year in timerange:
+            _download_articel_retry(page, config, year, month)
+            pbar.update()
 
         browser.close()
+
+    pbar.close()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="""Download National Geographic issues from the archive.
         This script is mostly configured through an ini-File for which an
-        example is distributed with the script. Sole dependency is playwrigth
-        and the chromium browser."""
+        example is distributed with the script."""
     )
 
     parser.add_argument(
-        "--date-range",
+        "--date_range",
+        default="01-2024--02-2025",
         type=str,
-        default="02-2025--02-2025",
         help="""Date range in MM-YYYY--MM-YYYY format (e.g., 01-2020--12-2024
         or 01-2025--01-2025 for a single download). Default is no range which
         automatically loads the latest entry in the archive.""",
