@@ -16,7 +16,7 @@ from typing import Tuple, Optional, List
 
 from tqdm import tqdm
 
-from multiprocessing import Pool
+import multiprocessing
 
 
 MONTH_MAP = [
@@ -83,6 +83,17 @@ def _format_date(date_str: str) -> Tuple[int, int]:
     assert year > 1887 and year < 2100
 
     return year, month
+
+
+def _click_cookie_noconsent(page: pw.Page, config: Config) -> bool:
+    try:
+        close_button = page.locator("div[id='onetrust-close-btn-container']")
+        close_button.click(timeout=config.timeout)
+        page.wait_for_load_state("domcontentloaded")
+
+        return True
+    except pw.TimeoutError:
+        return False
 
 
 def _signin_click_button(page: pw.Page, config: Config) -> bool:
@@ -162,16 +173,7 @@ def _signin_fill_otp(page: pw.Page, config: Config) -> bool:
         return False
 
 
-def _signin_cookies(page: pw.Page, config: Config):
-    if os.path.isfile(config.cookie_path):
-        with open(config.cookie_path, "r") as f:
-            cookies = json.load(f)
-            page.context.add_cookies(cookies)
-
-    page.goto("https://archive.nationalgeographic.com")
-
-    page.wait_for_load_state("domcontentloaded")
-
+def _signin_save_cookies(page: pw.Page, config: Config):
     signin_state = _signin_click_button(page, config)
 
     page.wait_for_timeout(config.timeout)
@@ -211,7 +213,20 @@ def _signin_cookies(page: pw.Page, config: Config):
     cookies = page.context.cookies()
     with open(config.cookie_path, "w") as f:
         json.dump(cookies, f)
+        
+        
+def _load_signin_cookies(page: pw.Page, config: Config):
+    if os.path.isfile(config.cookie_path):
+        with open(config.cookie_path, "r") as f:
+            cookies = json.load(f)
+            page.context.add_cookies(cookies)
+            
+    page.goto("https://archive.nationalgeographic.com")
 
+    page.wait_for_load_state("domcontentloaded")
+
+    _click_cookie_noconsent(page, config)
+    
 
 def _combine_canvas_sidebyside(
     config: Config,
@@ -396,7 +411,7 @@ def _get_timerange(date_start: str, date_end: str) -> List[Tuple[int, int]]:
     return timerange
 
 
-def fetch_natgeo_range(config: Config, date_start: str, date_end: str):
+def _fetch_natgeo_range(config: Config, timerange: List[Tuple[int,int]]):
     """
     Given two dates in format MM-YYYY and the config dataclass instance,
     this function downloads all national geographic magazines in the
@@ -405,10 +420,6 @@ def fetch_natgeo_range(config: Config, date_start: str, date_end: str):
     To download just a single magazine set date_end == date_start.
     """
 
-    timerange = _get_timerange(date_start, date_end)
-
-    pbar = tqdm(desc="Total", total=len(timerange))
-
     with pw.sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
 
@@ -416,15 +427,49 @@ def fetch_natgeo_range(config: Config, date_start: str, date_end: str):
             viewport={"width": config.vp_width, "height": config.vp_height}
         )
 
-        _signin_cookies(page, config)
+        _load_signin_cookies(page, config)
 
         for month, year in timerange:
             _download_articel_retry(page, config, year, month)
-            pbar.update()
 
         browser.close()
 
-    pbar.close()
+
+def fetch_natgeo(
+    config: Config, date_start: str, date_end: str, n_workers: int
+):
+    with pw.sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        
+        _load_signin_cookies(page, config)
+        _signin_save_cookies(page, config)
+        
+    
+    timerange = _get_timerange(date_start, date_end)
+    
+    avg_size = len(timerange) // n_workers
+    remainder = len(timerange) % n_workers
+    
+    timerange_split = [
+        timerange[
+            i * avg_size + min(i, remainder) :
+            (i + 1) * avg_size + min(i + 1, remainder)
+        ]
+        for i in range(n_workers)
+    ]
+    
+    workers = []
+    
+    for i in range(n_workers):
+        p = multiprocessing.Process(target=_fetch_natgeo_range, args=(config, timerange_split[i]))
+        workers.append(p)
+        p.start()
+
+    for p in workers:
+        p.join()
+        
+    print("Done Scraping!")
 
 
 if __name__ == "__main__":
@@ -435,7 +480,7 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--date_range",
+        "--date-range",
         default="01-2024--02-2025",
         type=str,
         help="""Date range in MM-YYYY--MM-YYYY format (e.g., 01-2020--12-2024
@@ -449,9 +494,15 @@ if __name__ == "__main__":
         default="config.ini",
         help="Config file containing account info and output location.",
     )
+    parser.add_argument(
+        "--n-workers",
+        type=int,
+        default=8,
+        help="Number of parallel workers for downloading issues.",
+    )
 
     args = parser.parse_args()
     date_start, date_end = args.date_range.split("--")
     config = Config.read(args.config)
 
-    fetch_natgeo_range(config, date_start, date_end)
+    fetch_natgeo(config, date_start, date_end, args.n_workers)
