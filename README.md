@@ -8,6 +8,5 @@ for your disney account from a browser in json format and add the file location
 to the ini config. The script will also save cookies by itself.
 
 TODO:
-- multiprocessing for parallel load of multiple magazines, and even pages of a single magazine
 - improved install process by packaging for pypi
 - tests for older magazines
